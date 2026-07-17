@@ -37,6 +37,10 @@ class DEIMMixin:
 
     def _init_layers(self) -> None:
         """Initialize layers except for backbone, neck and bbox_head."""
+        # DEIM trains from scratch, so use relative rotary positions in its
+        # hybrid encoder by default. Keeping this opt-in on the shared encoder
+        # preserves compatibility with existing RT-DETR checkpoints.
+        self.encoder.setdefault('use_rope', True)
         ref_hidden_dim = self.decoder.pop('ref_hidden_dim', None)
         ref_num_layers = self.decoder.pop('ref_num_layers', 2)
         ref_act_cfg = self.decoder.pop('ref_act_cfg',

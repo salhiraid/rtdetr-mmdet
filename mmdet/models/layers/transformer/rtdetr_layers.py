@@ -5,7 +5,9 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from mmcv.cnn import ConvModule, build_norm_layer
+from mmcv.cnn.bricks.transformer import FFN
 from mmengine.logging import print_log
 from mmengine.model import BaseModule, ModuleList
 from torch import Tensor, nn
@@ -18,6 +20,134 @@ from mmdet.utils import ConfigType, OptConfigType, OptMultiConfig
 from .deformable_detr_layers import DeformableDetrTransformerDecoderLayer
 from .dino_layers import CdnQueryGenerator, DinoTransformerDecoder
 from .utils import MLP, inverse_sigmoid
+
+
+class RotaryMultiheadAttention(nn.Module):
+    """Batch-first self-attention with two-dimensional rotary embeddings.
+
+    Unlike absolute positional embeddings, RoPE is applied to the projected
+    queries and keys.  This makes the encoder independent of a fixed feature
+    map size, which is important when DEIM is trained with multi-scale image
+    augmentations.
+    """
+
+    def __init__(self,
+                 embed_dims: int,
+                 num_heads: int = 8,
+                 dropout: float = 0.,
+                 bias: bool = True,
+                 batch_first: bool = True,
+                 **kwargs) -> None:
+        super().__init__()
+        if not batch_first:
+            raise ValueError('RotaryMultiheadAttention requires batch_first.')
+        if embed_dims % num_heads != 0:
+            raise ValueError('embed_dims must be divisible by num_heads.')
+        self.embed_dims = embed_dims
+        self.num_heads = num_heads
+        self.head_dims = embed_dims // num_heads
+        if self.head_dims % 4:
+            raise ValueError('The attention head dimension must be divisible '
+                             'by 4 for 2D RoPE.')
+        self.q_proj = nn.Linear(embed_dims, embed_dims, bias=bias)
+        self.k_proj = nn.Linear(embed_dims, embed_dims, bias=bias)
+        self.v_proj = nn.Linear(embed_dims, embed_dims, bias=bias)
+        self.out_proj = nn.Linear(embed_dims, embed_dims, bias=bias)
+        self.dropout = nn.Dropout(dropout)
+
+    @staticmethod
+    def _rotate_half(x: Tensor) -> Tensor:
+        first, second = x.chunk(2, dim=-1)
+        return torch.cat((-second, first), dim=-1)
+
+    def forward(self,
+                query: Tensor,
+                key: Optional[Tensor] = None,
+                value: Optional[Tensor] = None,
+                identity: Optional[Tensor] = None,
+                key_padding_mask: Optional[Tensor] = None,
+                attn_mask: Optional[Tensor] = None,
+                rope: Optional[Tuple[Tensor, Tensor]] = None,
+                **kwargs) -> Tensor:
+        """Apply self-attention and add the residual connection.
+
+        ``rope`` contains sine and cosine tensors shaped ``(H*W, head_dim)``.
+        It is intentionally separate from the input so position embeddings are
+        never added to values.
+        """
+        del kwargs
+        key = query if key is None else key
+        value = key if value is None else value
+        identity = query if identity is None else identity
+        batch_size, query_len, _ = query.shape
+        key_len = key.shape[1]
+
+        q = self.q_proj(query).reshape(batch_size, query_len, self.num_heads,
+                                       self.head_dims).transpose(1, 2)
+        k = self.k_proj(key).reshape(batch_size, key_len, self.num_heads,
+                                     self.head_dims).transpose(1, 2)
+        v = self.v_proj(value).reshape(batch_size, key_len, self.num_heads,
+                                       self.head_dims).transpose(1, 2)
+        if rope is not None:
+            sin, cos = (tensor.to(dtype=q.dtype, device=q.device)
+                        for tensor in rope)
+            if sin.shape != (query_len, self.head_dims) or cos.shape != sin.shape:
+                raise ValueError('RoPE shape must be (num_tokens, head_dim).')
+            q = q * cos[None, None] + self._rotate_half(q) * sin[None, None]
+            k = k * cos[None, None] + self._rotate_half(k) * sin[None, None]
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.head_dims**-0.5
+        if attn_mask is not None:
+            scores = scores + attn_mask
+        if key_padding_mask is not None:
+            scores = scores.masked_fill(key_padding_mask[:, None, None],
+                                        float('-inf'))
+        attention = F.softmax(scores, dim=-1)
+        attention = self.dropout(attention)
+        output = torch.matmul(attention, v).transpose(1, 2).reshape(
+            batch_size, query_len, self.embed_dims)
+        return identity + self.dropout(self.out_proj(output))
+
+
+class RotaryDetrTransformerEncoderLayer(BaseModule):
+    """DETR encoder layer whose self-attention uses 2D RoPE."""
+
+    def __init__(self, self_attn_cfg: OptConfigType, ffn_cfg: OptConfigType,
+                 norm_cfg: OptConfigType = dict(type='LN'),
+                 init_cfg: OptConfigType = None) -> None:
+        super().__init__(init_cfg=init_cfg)
+        self_attn_cfg = self_attn_cfg.copy()
+        self_attn_cfg.setdefault('batch_first', True)
+        self.self_attn = RotaryMultiheadAttention(**self_attn_cfg)
+        self.embed_dims = self.self_attn.embed_dims
+        self.ffn = FFN(**ffn_cfg)
+        self.norms = ModuleList([
+            build_norm_layer(norm_cfg, self.embed_dims)[1] for _ in range(2)
+        ])
+
+    def forward(self, query: Tensor, rope: Tuple[Tensor, Tensor],
+                key_padding_mask: Optional[Tensor] = None) -> Tensor:
+        query = self.norms[0](self.self_attn(
+            query, key_padding_mask=key_padding_mask, rope=rope))
+        return self.norms[1](self.ffn(query))
+
+
+class RotaryDetrTransformerEncoder(BaseModule):
+    """Stack of DETR encoder layers using rotary self-attention."""
+
+    def __init__(self, num_layers: int, layer_cfg: OptConfigType) -> None:
+        super().__init__()
+        self.layers = ModuleList([
+            RotaryDetrTransformerEncoderLayer(**layer_cfg)
+            for _ in range(num_layers)
+        ])
+        self.embed_dims = self.layers[0].embed_dims
+
+    def forward(self, query: Tensor, rope: Tuple[Tensor, Tensor],
+                key_padding_mask: Optional[Tensor] = None) -> Tensor:
+        for layer in self.layers:
+            query = layer(query, rope, key_padding_mask)
+        return query
 
 
 class RepVGGBlock(nn.Module):
@@ -501,6 +631,8 @@ class RTDETRHybridEncoder(BaseModule):
                  use_encoder_idx: List[int] = [2],
                  num_encoder_layers: int = 1,
                  pe_temperature: float = 10000.0,
+                 rope_base: float = 10000.0,
+                 use_rope: bool = False,
                  spatial_shapes: Optional[Tuple[Tuple[int, int]]] = None,
                  encode_before_fpn: bool = True,
                  with_cp: bool = False,
@@ -510,6 +642,8 @@ class RTDETRHybridEncoder(BaseModule):
         self.in_channels = in_channels
         self.use_encoder_idx = use_encoder_idx
         self.pe_temperature = pe_temperature
+        self.rope_base = rope_base
+        self.use_rope = use_rope
         self.encode_before_fpn = encode_before_fpn
 
         if isinstance(num_encoder_layers, int):
@@ -524,9 +658,11 @@ class RTDETRHybridEncoder(BaseModule):
             if fpn_cfg is not None else nn.Identity()
 
         # encoder transformer
+        encoder_cls = RotaryDetrTransformerEncoder if use_rope \
+            else DetrTransformerEncoder
         self.transformer_blocks = nn.ModuleList([
-            DetrTransformerEncoder(num_layers, layer_cfg,
-                                   num_layers if with_cp else -1)
+            encoder_cls(num_layers, layer_cfg) if use_rope else encoder_cls(
+                num_layers, layer_cfg, num_layers if with_cp else -1)
             for num_layers in num_encoder_layers
         ])
 
@@ -569,6 +705,24 @@ class RTDETRHybridEncoder(BaseModule):
         ]
         return torch.cat(pos_embd, axis=1)[None, :, :]
 
+    @staticmethod
+    def build_2d_rope_position_embedding(
+            h: int, w: int, head_dim: int, base: float,
+            device: torch.device) -> Tuple[Tensor, Tensor]:
+        """Build axial RoPE factors for a flattened ``(h, w)`` feature map."""
+        if head_dim % 4:
+            raise ValueError('The attention head dimension must be divisible '
+                             'by 4 for 2D RoPE.')
+        y, x = torch.meshgrid(torch.arange(h, device=device),
+                              torch.arange(w, device=device), indexing='ij')
+        frequencies = base**(-torch.arange(
+            head_dim // 4, device=device, dtype=torch.float32) /
+                              (head_dim // 4))
+        angles = torch.cat((x.reshape(-1, 1) * frequencies,
+                            y.reshape(-1, 1) * frequencies), dim=-1)
+        angles = angles.repeat(1, 2)
+        return angles.sin(), angles.cos()
+
     def encode_forward(self, inputs: Tuple[Tensor]) -> Tuple[Tensor]:
         """
         Args:
@@ -586,16 +740,26 @@ class RTDETRHybridEncoder(BaseModule):
             # flatten [B, C, H, W] to [B, HxW, C]
             src_flatten = outs[enc_ind].flatten(2).permute(0, 2,
                                                            1).contiguous()
-            pos_embed = getattr(self, f'position_embedding_{enc_ind}', None)
-            if pos_embed is None:
-                pos_embed = self.build_2d_sincos_position_embedding(
-                    w,
-                    h,
-                    embed_dim=c,
-                    temperature=self.pe_temperature,
-                    device=src_flatten.device)
-            memory = self.transformer_blocks[i](
-                src_flatten, query_pos=pos_embed, key_padding_mask=None)
+            if self.use_rope:
+                num_heads = self.transformer_blocks[i].layers[
+                    0].self_attn.num_heads
+                head_dim = c // num_heads
+                rope = self.build_2d_rope_position_embedding(
+                    h, w, head_dim, self.rope_base, src_flatten.device)
+                memory = self.transformer_blocks[i](
+                    src_flatten, rope=rope, key_padding_mask=None)
+            else:
+                pos_embed = getattr(self, f'position_embedding_{enc_ind}',
+                                    None)
+                if pos_embed is None:
+                    pos_embed = self.build_2d_sincos_position_embedding(
+                        w,
+                        h,
+                        embed_dim=c,
+                        temperature=self.pe_temperature,
+                        device=src_flatten.device)
+                memory = self.transformer_blocks[i](
+                    src_flatten, query_pos=pos_embed, key_padding_mask=None)
             outs[enc_ind] = memory.permute(0, 2,
                                            1).contiguous().reshape(b, c, h, w)
 
